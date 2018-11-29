@@ -1,0 +1,259 @@
+---
+title: "limma_voom"
+author: "jrm"
+date: "11/28/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data
+
+Data was obtained from Julin Maloof's BIS180L course:
+http://jnmaloof.github.io/BIS180L_web/2018/05/22/RNAseq-edgeR/
+
+A description of the experiment:
+
+> "We will study gene expression levels in Brassica rapa internodes grown under two treatments, Dense Planting (DP) and Not Dense Planting (NDP). We will study the response to DP in two cultivars, IMB211 and R500. Click to download the internode count data. This data set has 12 samples with counts of 40991 genes."
+
+```{r}
+library(edgeR)
+library(limma)
+library(Glimma)
+```
+
+## Data preprocessing
+
+```{r data preprocessing}
+rawCounts <- read.delim("gh_internode_counts2.tsv",
+                        header = T, # Table has a header (column names)
+                        row.names = 1) # Treat the first column as the row names
+head(rawCounts)
+
+## Remove unwanted entries
+# Genes that didn't map to a gene are summed into a "*" feature
+rawCounts <- rawCounts[-grep("\\*",rownames(rawCounts)),]
+
+## Deal with missing values (NA) 
+any(is.na(rawCounts))
+rawCounts[is.na(rawCounts)] <- 0 #Convert all missing values to 0
+```
+
+
+### metadata
+
+It is a good practice to create a *metadata* file. Essentially, a table with information (as much as you can) about the samples, for example:
+
+* Genotype
+* Treatment
+* Age
+* Time of the day at collection
+* Replicate number
+* Other
+  * Even the sequencing lane or thestrips of PCR tubes in which samples are processed can have some influence (batch effects)
+
+This data frame can be manually created using excel, or on the same script using R magic!
+
+By looking at the column names we can get an idea of the samples in the data. We can observe two things:
+
+1. Naming convention is consistent across samples 
+  (This will make our life easier!)
+2. There is some unecessary information that we can discard right away (ie, `.fq.bam` extension of the files)
+
+```{r}
+colnames(rawCounts) # Check the names of the samples
+samples <- colnames(rawCounts) #Store the sample names into a new variable
+
+samples <- gsub("_matched.merged.fq.bam","",samples) #Remove unecessary information
+
+## Now we want to separate each bit of information into columns:
+# I will nest two functions:
+# the inner (strsplit), will separate into unique fields the sample names each time it sees an underscore
+# the middle (do.call), will take these fields and arrange them into a matrix (by rows, with rbind)
+# the outer just converts the matrix into a data frame and adds the samples as rownames
+# Since the naming convention is the same for all samples, we don't need to worry about having a table of different sizes
+
+meta <- data.frame( do.call("rbind",
+                        strsplit(samples,"_") 
+                    ),row.names = samples)
+
+## Manually add the column names
+colnames(meta) <- c("genotype","treatment","replicate","tissue")
+
+## We can create a new group that combines genotype and treatment to make comparisons easier:
+meta$group <- paste(meta$genotype,meta$treatment,sep = "_")
+
+
+meta
+```
+
+An important thing to consider is that the names of the columns in the counts table match the rownames in the metadata table
+
+```{r}
+colnames(rawCounts) == rownames(meta) #Since we manually got rid of the extra info, we need to make sure they match.
+
+# We simply apply the same line on the column names of the counts table
+colnames(rawCounts) <- gsub("_matched.merged.fq.bam","",colnames(rawCounts)) 
+
+# done! 
+all(colnames(rawCounts) == rownames(meta))
+```
+
+# Differential Gene Expression
+
+#### Create the DGE object
+
+edgeR (and limma) use a specific type of object to do all of their inner workings, so we need to call a function to create it, using the count data
+
+```{r}
+dge <- DGEList(counts=rawCounts,
+               remove.zeros = T) # Removes genes that were consistently not expressed (0 counts) across all samples
+
+nrow(rawCounts)
+nrow(dge)
+```
+
+#### Remove lowly expressed genes
+
+To remove noisy genes, we can filter the data. This ensures we're working with biologically meaningful genes.
+
+We ask for genes for which, in at least 3 (which is the number of replicates per group) of *ANY* samples, the CPM is higher than 1.
+
+```{r}
+isexpr <- rowSums(cpm(dge) > 1) >= 3 
+dge <- dge[isexpr,,
+           keep.lib.size = FALSE] #Recalculates the library size after removing lowly expressed genes
+```
+
+For a deeper discussion on this, check the article  `RNA-seq analysis is easy as 1-2-3 with limma, Glimma and edgeR` (https://f1000research.com/articles/5-1408/)
+
+
+#### Normalization
+
+The normalization step is used to ensure that libraries are comparable among one another, and aims to reduce variation that is not biologically interesting.
+
+```{r}
+dge <- calcNormFactors(dge)
+```
+
+#### Design and contrast matrix
+
+This is an important step since it defines what will be compared and how. 
+
+Using the metadata object we created earlier, we'll tell edgeR to create the design matrix using a linear model. The linear model explanation and its use in differential expression analysis is outside of the scope of this primer. In short, using the model we're telling edgeR that expression of the gene is influenced by different factors (ie, genotype and/or treatment). Later, by use of a fit and regression, we can ask if either (or an interaction) are significantly influencing expression of the gene.
+
+
+
+```{r}
+### Create design matrix
+
+# model.matrix(~0+genotype + treatment, data=meta)
+design <- model.matrix(~0+group, data=meta) #To make comparisons, the grouping factor is a better option
+colnames(design) <- gsub("genotype|treatment|group|:|-|/","",colnames(design)) # 
+head(design)
+
+colSums(design) # Should be the same as number of bioreps per group 
+```
+
+#### voom() function in limma
+
+voom() transforms the values to logCPM (assumed to be normally distributed). It also makes use of the design matrix defined previously. Further normalization can be obtained using the `normalize.method` parameter.
+
+> "When the library sizes are quite variable between samples, then the voom approach is theoretically
+more powerful than limma-trend. In this approach, the voom transformation is applied to the normalized and filtered DGEList object:"
+
+(https://www.bioconductor.org/packages/release/bioc/vignettes/limma/inst/doc/usersguide.pdf)
+
+```{r}
+v <- voom(dge, design, plot = TRUE,normalize.method = "quantile")
+```
+
+#### Distribution of the data
+
+To look at how the samples behave once the counts have been normalized we can generate an interactive MDS plot
+
+```{r}
+glMDSPlot(v, labels=rownames(meta), groups=meta, 
+          folder=paste0("glimma_voom"),
+          launch=T)
+```
+
+
+```{r}
+### Contrasts & DGE
+v2 <- lmFit(v, design)
+contrastMatrix <- makeContrasts(
+  
+  "DensePlanting_vs_NonDP_IMB211"=(IMB211_DP-IMB211_NDP),
+  "DensePlanting_vs_NonDP_R500"=(R500_DP-R500_NDP), 
+  levels = design)
+
+```
+
+
+```{r}
+fit2 <- contrasts.fit(v2, contrastMatrix)
+fit2 <- eBayes(fit2)
+results <- decideTests(fit2)
+t(summary(results))
+```
+
+
+#### Automatization: Get DEGs per contrast
+
+```{r}
+
+# Define an adjusted P-value cut to call significant genes
+pValCut <- 0.05 
+
+## Define the contrasts
+uniqContrasts <- colnames(contrastMatrix)
+
+### Prepare lists to save results
+DEList <- list()
+DESignificant <- list()
+
+for (contrast in uniqContrasts){
+  cat(" - - - \n")
+  ##
+  
+  cat("Contrast:", paste0(contrast),"\n")
+  #
+  tmp <- topTable(fit2, coef=contrast,number = Inf,sort.by = "none")
+  
+  
+  ### Change names of columns
+  colnames(tmp) <- paste(contrast,colnames(tmp),sep = ".")
+  
+  ## Save to list
+  DEList[[contrast]] <- tmp
+  
+  ## Filter
+  tmpIDX <- grep("adj.P.Val",colnames(tmp))
+  tmpSign <- tmp[tmp[,tmpIDX] < pValCut,]
+  nrow(tmpSign)
+  DESignificant[[contrast]] <- tmpSign
+  
+  cat ("Number of DEGs on",contrast,":",nrow(tmpSign),"\n")
+  #
+}
+
+names(DEList)
+```
+
+
+#### Filter significant genes
+```{r}
+sapply(DEList,function(x){
+  nrow(x[x[,grep("adj.P.Val",colnames(x))] < 0.05,])
+})
+
+significantDE <- lapply(DEList,function(x){ x[x[,grep("adj.P.Val",colnames(x))] < 0.05,] })
+sapply(significantDE,nrow)
+```
+
+

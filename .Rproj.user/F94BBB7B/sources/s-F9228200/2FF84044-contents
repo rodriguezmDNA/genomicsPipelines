@@ -1,0 +1,306 @@
+#source("https://bioconductor.org/biocLite.R")
+#biocLite(c("edgeR","limma","calibrate"))
+#biocLite(c("Glimma"))
+library(edgeR)
+library(gplots) #install.packages("gplots")
+library(calibrate)
+library(RColorBrewer)
+library(limma)
+source("~/Desktop/SolanOmics/03_Results_jrm/Scripts/metaFunctions_forNetworkAnalysis.R")
+
+setwd("~/Desktop/SolanOmics/06b_limmaTRAP/")
+
+
+####################################################################################
+####################################################################################
+
+load("CountData/GeneCounts_Total_TRAP.RData")
+meta <- read.table("meta/meta_total_TRAP.txt",sep = "\t",stringsAsFactors = F,row.names = 1,header = T)
+
+###
+checkNames <- function(){
+  if ((all(colnames(GeneCounts) %in% rownames(meta)))){
+    cat ("all is good, # of samples:", nrow(meta))
+  } else {
+    warning("Check sample names")
+  }}
+###
+checkNames()
+
+################
+#### Filter
+################
+
+### Remove outliers // id'd by MDS plots in previous analyses
+doFilter <- T
+if (doFilter){
+  cat ("Filtering low counts and outlier samples \n")
+  lowCountsSamples <- c(
+    "SG.TRAP.03_S10_L005_R1_001", # Low counts
+    "SG.TRAP.15_S22_L005_R1_001", # Low counts
+    "SG.TRAP.21_S28_L005_R1_001", # Low counts
+    "SG.TRAP.06_S13_L005_R1_001", #Outlier
+    ##
+    "R5_D06_ele_M82_shoot" #Outlier
+  )
+  
+  cat ("Removing:\n",paste(lowCountsSamples,sep ="\t",collapse ="\n"))
+  GeneCounts <- GeneCounts[,-which(colnames(GeneCounts) %in% lowCountsSamples)]
+  meta <- meta[-which(rownames(meta) %in% lowCountsSamples),]
+} else { cat ("No filter \n") }
+
+checkNames()
+
+### Remove R2 samples (sharon had originaly removed these)
+doFilterTotal <- T
+if (doFilterTotal){
+  cat ("Filtering R2 (from total) samples \n")
+  indexR2 <- grep("R2_*",colnames(GeneCounts))
+  cat ("Removing:\n",paste(colnames(GeneCounts)[indexR2],sep ="\t",collapse ="\n"))
+  GeneCounts <- GeneCounts[,-indexR2]
+  meta <- meta[-indexR2,]
+} else { cat ("No filter \n") }
+checkNames()
+##
+
+
+### Remove R2 samples (sharon had originaly removed these)
+doFilterTRAP <- F
+if (doFilterTRAP){
+  cat ("Filtering out total samples \n")
+  indexKeep <- grep("TRAP",meta$Samples,ignore.case = T)
+  cat ("Keeping:\n",paste(meta$Samples[indexKeep],sep ="\t",collapse ="\n"))
+  GeneCounts <- GeneCounts[,indexKeep]
+  meta <- meta[indexKeep,]
+} else { cat ("No filter \n") }
+checkNames()
+##
+
+
+#########
+dim(GeneCounts)
+
+###### Get metadata & prepare for design matrix
+##################
+meta$Groups <- paste0(meta$Day,meta$Treat,meta$Geno,meta$Tissue,meta$RNASource)
+meta$Groups <- relevel(as.factor(meta$Groups),ref="D06ambM82shoottotal")
+
+meta$DaySource <- paste0(meta$Day,meta$RNASource)
+meta$TreatSource <- paste0(meta$Treat,meta$RNASource)
+meta$GenoSource <- paste0(meta$Geno,meta$RNASource)
+meta$TissueSource <- paste0(meta$Tissue,meta$RNASource)
+
+meta$DayTreatSource <- paste0(meta$Day,meta$Treatment,meta$RNASource)
+meta$DayGenoSource <- paste0(meta$Day,meta$Genotype,meta$RNASource)
+meta$DayTissueSource <- paste0(meta$Day,meta$Tissue,meta$RNASource)
+
+### Create design matrix
+design <- model.matrix(~0+Groups, data=meta)#+Lane
+colnames(design) <- gsub("Day|meta|Name|Genotype|Treatment|:|-|/|Groups","",colnames(design))
+head(design)
+#rowSums(design) # Should be 1
+colSums(design) # Should be the same as number of bioreps
+all(rowSums(design)==1)
+##################
+
+
+###### Remove genes with 0 counts
+##################
+cat("Removing genes with 0 counts on all conditions \n")
+cat("Initial number of genes:",nrow(GeneCounts),"\n")
+rmIDX <- which(rowSums(GeneCounts) == 0)
+if (length(rmIDX) != 0){
+  cat("Removing",length(rmIDX),"genes \n")
+  GeneCounts <- GeneCounts[-rmIDX,]
+  cat("Remaining number of genes:",nrow(GeneCounts),"\n")
+} else {
+  cat("No genes with 0 counts on all  \n")
+}
+##################
+
+dge <- DGEList(counts=GeneCounts,remove.zeros = T)
+sampleMin <- min(table(meta$Groups))
+minCPM <- 1
+#sampleMin <- 2
+isexpr <- rowSums(cpm(dge) > minCPM) >= sampleMin #Make sure to use the minimum number of reps
+dge <- dge[isexpr,,keep.lib.size = FALSE]
+
+
+## Remove genes with 0 observations on ANY sample
+removeZero <- F
+if (removeZero){
+  ## Remove genes with a count of 0 in any of the samples
+  AnyZeroIndex <- apply( cpm(dge),1,function(x){
+    any(x==0) # Genes with any 0 count
+  })
+  dge <- dge[!AnyZeroIndex,,keep.lib.size = FALSE]
+}
+
+table(apply(dge,1,function(x){any(x==0)}))
+
+## After filtering, I calculate the normalization factors with TMM
+dge <- calcNormFactors(dge)
+
+## Then transform with voom (and renormalize with quantile).
+v <- voom(dge, design, plot = TRUE,normalize.method = "quantile")
+
+
+library(Glimma)
+glMDSPlot(v, labels=meta$Files, groups=meta, 
+          folder=paste0("glimmaTotal_FilterLowCounts_RemoveR2total_"),
+          launch=T)
+
+# ### Save Expression Data
+cpmExpression <- cpm(dge)
+voomExpression <- v$E
+colnames(cpmExpression) <- meta[colnames(cpmExpression),"Samples"]
+colnames(voomExpression) <- meta[colnames(voomExpression),"Samples"]
+
+save(cpmExpression,file = "normalizedData/cpmExpression_AllData.RData")
+save(voomExpression,file = "normalizedData/voomExpression_AllData.RData")
+
+
+### Contrasts & DGE
+v2 <- lmFit(v, design)
+contrastMatrix <- makeContrasts(
+  #### TRAP
+  ## d06
+  "d06_Sly_eleVSamb_TRAP"=(D06eleM82shTRAP-D06ambM82shTRAP),
+  "d12_Sly_eleVSamb_TRAP"=(D12eleM82shTRAP-D12ambM82shTRAP),
+  # ## d12
+  "d06_Spe_eleVSamb_TRAP"=(D06elepennshTRAP-D06ambpennshTRAP),
+  "d12_Spe_eleVSamb_TRAP"=(D12elepennshTRAP-D12ambpennshTRAP),
+  
+  #### Total
+  ## M82/Day
+  # root
+  "d06_Sly_eleVSamb_RootTotal"=(D06eleM82roottotal-D06ambM82roottotal),
+  "d09_Sly_eleVSamb_RootTotal"=(D09eleM82roottotal-D09ambM82roottotal),
+  "d12_Sly_eleVSamb_RootTotal"=(D12eleM82roottotal-D12ambM82roottotal),
+  # root
+  "d06_Sly_eleVSamb_ShootTotal"=(D06eleM82shoottotal-D06ambM82shoottotal),
+  "d09_Sly_eleVSamb_ShootTotal"=(D09eleM82shoottotal-D09ambM82shoottotal),
+  "d12_Sly_eleVSamb_ShootTotal"=(D12eleM82shoottotal-D12ambM82shoottotal),
+  
+  ## penn/Day
+  # root
+  "d06_Spe_eleVSamb_RootTotal"=(D06elepennroottotal-D06ambpennroottotal),
+  "d09_Spe_eleVSamb_RootTotal"=(D09elepennroottotal-D09ambpennroottotal),
+  "d12_Spe_eleVSamb_RootTotal"=(D12elepennroottotal-D12ambpennroottotal),
+  # root
+  "d06_Spe_eleVSamb_ShootTotal"=(D06elepennshoottotal-D06ambpennshoottotal),
+  "d09_Spe_eleVSamb_ShootTotal"=(D09elepennshoottotal-D09ambpennshoottotal),
+  "d12_Spe_eleVSamb_ShootTotal"=(D12elepennshoottotal-D12ambpennshoottotal),
+  
+  levels = design)
+
+
+fit2 <- contrasts.fit(v2, contrastMatrix)
+fit2 <- eBayes(fit2)
+results <- decideTests(fit2)
+t(summary(results))
+
+# ######## Get DEGs per contrast
+# ################################
+#
+pValCut <- 0.05
+
+uniqContrasts <- colnames(contrastMatrix)
+
+### Prepare lists
+DEList <- list()
+DESignificant <- list()
+
+uniqContrasts <- uniqContrasts[grep("_",uniqContrasts)]
+#
+for (contrast in uniqContrasts){
+  cat(" - - - \n")
+  #
+  # Get indices that correspond to treatment, genotype and interaction
+  
+  #genoIndex <- grep(contrast,colnames(fit2$coefficients))
+  dropContrasts <- contrast#c(genoIndex)#,treatIndex)
+  ##
+  contrastNames <- contrast#colnames(fit2$coefficients)[dropContrasts]
+  cat("Contrast:", paste0(contrastNames),"\n")
+  #
+  tmp <- topTable(fit2, coef=dropContrasts,number = Inf,sort.by = "none")
+  #tmp[,"Symbol"] <- rownames(tmp)
+  #-- Add gene symbols
+  #Genes <- rownames(tmp)
+  #idx <- intersect(names(AGI2Symbol),Genes)
+  #tmp[idx,"Symbol"] <- AGI2Symbol[idx]
+  
+  ###Change names of columns
+  # Get indices of columns that correspond to logFC
+  #tmpIDX <- grep(paste(contrastNames,collapse="|"),colnames(tmp))
+  colnames(tmp) <- paste(contrast,colnames(tmp),sep = ".")
+  #colnames(tmp)[tmpIDX] <- paste(colnames(tmp)[tmpIDX],"logFC",sep = ".")
+  #
+  DEList[[contrast]] <- tmp
+  
+  ## Filter
+  tmpIDX <- grep("adj.P.Val",colnames(tmp))
+  tmpSign <- tmp[tmp[,tmpIDX] < pValCut,]
+  nrow(tmpSign)
+  DESignificant[[contrast]] <- tmpSign
+  #
+  cat ("Number of DEGs on",contrast,":",nrow(tmpSign),"\n")
+  #cat("\n")
+  #
+}
+
+names(DEList)
+
+## Get only significant genes
+#sapply(DEList,function(x){table(x[,grep("adj.P.Val",colnames(x))] < 0.05)})
+sapply(DEList,function(x){
+  nrow(x[x[,grep("adj.P.Val",colnames(x))] < 0.05,])
+})
+
+significantDE <- lapply(DEList,function(x){ x[x[,grep("adj.P.Val",colnames(x))] < 0.05,] })
+sapply(significantDE,nrow)
+
+shortName <- "contrasts_AllData"
+saveDElist <- paste0("Results/DEList_",shortName,".RData")
+save(file = saveDElist,DEList)
+
+
+#### Number of DEGs 
+results <- decideTests(fit2)
+
+library(tidyverse)
+DiffExprCounts <- as.tibble(t(summary(results))[,-2])
+colnames(DiffExprCounts) <- c("Contrast","Direction","Counts")
+
+#DiffExprCounts <-  DiffExprCounts %>%
+#  separate(Contrast,into = c("Day","Genotype","Comparison","Source"),sep="_",remove = F)
+
+library(gplots)
+
+
+DiffExprCounts %>% mutate(Contrast=factor(DiffExprCounts$Contrast,levels = unique(DiffExprCounts$Contrast))) %>%
+  ggplot(.) + 
+  theme_classic() + #coord_flip() +
+  geom_bar(mapping = aes(x = Contrast, y = Counts,fill=Direction),stat = "identity", position="dodge") +
+  geom_text(aes(Contrast, mean(Counts),group=Direction, label=paste0("(",Counts,")")),
+            size=2.5, position = position_dodge(width=0.9)) +
+  theme(aspect.ratio = 1) + coord_flip() + 
+  theme(axis.text.y = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = NULL) + #facet_grid(Genotype~Day~Source,scales="free_y") +
+  scale_fill_brewer(palette="Paired",name="") + theme_gray() #+ coord_polar() 
+
+
+library(RColorBrewer)
+
+bar <- DiffExprCounts %>% mutate(Contrast=factor(DiffExprCounts$Contrast,levels = unique(DiffExprCounts$Contrast))) %>%
+  ggplot(.) + 
+  geom_bar( alpha=0.8,
+            mapping = aes(x = Contrast, y = Counts),
+            stat = "identity",  show.legend = T,width = 0.5)  + 
+  theme(aspect.ratio = 1) + 
+  labs(x = NULL, y = NULL)
+
+bar + coord_flip() + scale_fill_brewer(palette="Paired") #+ facet_grid(Day~Source) 
+#bar + coord_polar() + theme_minimal() + scale_fill_brewer(palette="Paired") #+ facet_grid(.~Day) + 
+
