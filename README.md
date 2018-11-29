@@ -1,1 +1,1 @@
-# genomicsPipelines
+# Genomics Pipelines
